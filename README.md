@@ -4,14 +4,14 @@ terminal command to run plane 1
 
 ```
 cd ardupilot
-./Tools/autotest/sim_vehicle.py -v ArduPlane --model jsbsim --aircraft Rascal110 -I0 --sysid=1 --out=udp:127.0.0.1:14550 --map --enable-fgview
+./Tools/autotest/sim_vehicle.py -v ArduPlane --model jsbsim --aircraft Rascal110 -I0 --sysid=1 --out=udp:127.0.0.1:14550 --map --enable-fgview --out=udp:127.0.0.1:14552
 ```
 
 terminal Command to run plane 2
 
 ```
 cd ardupilot
-./Tools/autotest/sim_vehicle.py -v ArduPlane --model jsbsim --aircraft Rascal110 -I1 --sysid=2 --out=udp:127.0.0.1:14560 --map --enable-fgview
+./Tools/autotest/sim_vehicle.py -v ArduPlane --model jsbsim --aircraft Rascal110 -I1 --sysid=2 --out=udp:127.0.0.1:14560 --map --enable-fgview --out=udp:127.0.0.1:14562
 ```
 
 cmd to run Flight Gear visualisation connection
