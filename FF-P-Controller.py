@@ -19,13 +19,14 @@ class ArduPlaneFeedForwardController:
         self.v_c = offsets.get('v_c', 0.0) 
 
         # --- TUNED CONTROLLER GAINS ---
-        self.K_ROLL = 0.15
+        self.K_ROLL = 0.4
         self.K_PITCH = 0.02
-        self.K_THRUST = 0.0015
+        self.K_THRUST = 0.006
         self.BASE_THRUST = 0.0834
+        self.K_CROSS_HEADING = 0.02
 
         # --- TURN COMPENSATION (FEED-FORWARD) ---
-        self.K_FEEDFORWARD = 0.75  
+        self.K_FEEDFORWARD = 0.0 
         
         self.MAX_ROLL = math.radians(40)   
         self.MAX_PITCH = math.radians(10)  
@@ -33,7 +34,7 @@ class ArduPlaneFeedForwardController:
         # Command Smoothing (Low-Pass Filter)
         self.last_roll_cmd = 0.0
         self.last_pitch_cmd = 0.0
-        self.SMOOTHING_ALPHA = 0.3  
+        self.SMOOTHING_ALPHA = 1
 
         # State tracking
         self.leader_ned = self._empty_ned()
@@ -175,33 +176,60 @@ class ArduPlaneFeedForwardController:
 
                     dist_to_slot = math.hypot(slot_n - f_n, slot_e - f_e)
 
-                    # 2. Roll Calculation
-                    target_yaw = math.atan2(slot_e - f_e, slot_n - f_n)
+                    along_m, cross_m = self.formation_separation()
+                    cross_err = cross_m - self.l_c
+                    along_err = along_m - self.f_c
+
+                    # ---------------------------------------------------------
+                    # 2. Roll Calculation (Vector Pursuit Geometry)
+                    # ---------------------------------------------------------
+                    # Calculate the baseline heading directly toward the slot
+                    heading_to_slot = math.atan2(slot_e - f_e, slot_n - f_n)
+                    heading_to_slot = (heading_to_slot + math.pi) % (2 * math.pi) - math.pi
+
+                    # If the leader is flying straight, we want to match their course 
+                    # and use cross-track error to slide left/right.
+                    if abs(self.leader_roll) < math.radians(5.0):
+                        MAX_INTERCEPT_ANGLE = math.radians(25) 
+                        heading_correction = cross_err * self.K_CROSS_HEADING 
+                        heading_correction = max(-MAX_INTERCEPT_ANGLE, min(MAX_INTERCEPT_ANGLE, heading_correction))
+                        target_yaw = self.chi_L + heading_correction
+                    
+                    # If the leader is actively turning, matching their heading causes corner cutting.
+                    # Instead, force the follower to steer directly toward the spatial slot coordinates.
+                    else:
+                        # Blend the leader's heading with the direct line to the slot based on distance.
+                        # This creates an "elastic tether" to the slot position.
+                        blend_factor = min(1.0, dist_to_slot / 30.0) # 0.0 at slot, 1.0 when 30m away
+                        
+                        # Unroll/unwrap angles safely for linear interpolation
+                        diff = heading_to_slot - self.chi_L
+                        diff = (diff + math.pi) % (2 * math.pi) - math.pi
+                        
+                        target_yaw = self.chi_L + (diff * blend_factor)
+
+                    # Normalize target_yaw
+                    target_yaw = (target_yaw + math.pi) % (2 * math.pi) - math.pi
+
+                    # Core Heading Tracking Loop
                     heading_error = target_yaw - self.chi_F
                     heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
-                    
-                    local_k_roll = self.K_ROLL
-                    if dist_to_slot < 10.0:
-                        local_k_roll *= (dist_to_slot / 10.0)
 
-                    feedback_roll = heading_error * local_k_roll
-                    feedforward_roll = self.K_FEEDFORWARD * self.leader_roll
+                    feedback_roll = heading_error * self.K_ROLL
                     
+                    feedforward_roll = self.K_FEEDFORWARD * self.leader_roll
+
                     raw_roll = feedback_roll + feedforward_roll
                     raw_roll = max(-self.MAX_ROLL, min(self.MAX_ROLL, raw_roll))
+                    # ---------------------------------------------------------
 
                     # 3. Pitch and Thrust Calculations
                     alt_error = f['d'] - slot_d 
                     raw_pitch = max(-self.MAX_PITCH, min(self.MAX_PITCH, alt_error * self.K_PITCH))
 
-                    along_m, cross_m = self.formation_separation()
-                    
-                    # Compute explicit target tracking errors
-                    along_err = along_m - self.f_c  # + means too far behind slot, - means too close
-                    cross_err = cross_m - self.l_c  # Error relative to the offset slot
 
                     target_thrust = self.BASE_THRUST + (along_err * self.K_THRUST)
-                    target_thrust = max(0.2, min(0.95, target_thrust))
+                    
 
                     # 4. Command Low-Pass Filtering
                     smoothed_roll = (self.SMOOTHING_ALPHA * raw_roll) + ((1.0 - self.SMOOTHING_ALPHA) * self.last_roll_cmd)
@@ -227,6 +255,6 @@ class ArduPlaneFeedForwardController:
             print("\nShutting down controller.")
 
 if __name__ == "__main__":
-    clearances = {'f_c': 25.0, 'l_c': 5.0, 'v_c': 0.0}
+    clearances = {'f_c': 10.0, 'l_c': -10.0, 'v_c': 0.0}
     controller = ArduPlaneFeedForwardController("udp:127.0.0.1:14552", "udp:127.0.0.1:14562", clearances)
     controller.run()
