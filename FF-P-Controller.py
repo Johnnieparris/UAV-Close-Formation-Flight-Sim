@@ -26,7 +26,7 @@ class ArduPlaneFeedForwardController:
         self.K_CROSS_HEADING = 0.02
 
         # --- TURN COMPENSATION (FEED-FORWARD) ---
-        self.K_FEEDFORWARD = 0.0 
+        self.K_FEEDFORWARD = 0.8 
         
         self.MAX_ROLL = math.radians(40)   
         self.MAX_PITCH = math.radians(10)  
@@ -108,7 +108,8 @@ class ArduPlaneFeedForwardController:
             if speed > 0.5:
                 self.chi_L = math.atan2(msg.vy, msg.vx)
         elif msg.get_type() == 'ATTITUDE':
-            self.leader_roll = msg.roll  
+            self.leader_roll = msg.roll
+            self.chi_L = msg.yaw  
 
     def _handle_follower_msg(self, msg):
         if msg.get_type() == 'LOCAL_POSITION_NED':
@@ -119,9 +120,7 @@ class ArduPlaneFeedForwardController:
                 self.chi_F = math.atan2(msg.vy, msg.vx)
 
     def _sync_offset(self):
-        self.offset['n'] = self.leader_ned['n'] - self.follower_ned['n']
-        self.offset['e'] = self.leader_ned['e'] - self.follower_ned['e']
-        self.offset['d'] = self.leader_ned['d'] - self.follower_ned['d']
+        self.offset = {'n': 0.0, 'e': 0.0, 'd': 0.0} 
         self.has_offset = True
 
     def _follower_in_leader_ned(self):
@@ -255,6 +254,6 @@ class ArduPlaneFeedForwardController:
             print("\nShutting down controller.")
 
 if __name__ == "__main__":
-    clearances = {'f_c': 10.0, 'l_c': -10.0, 'v_c': 0.0}
+    clearances = {'f_c': 10.0, 'l_c': 0.0, 'v_c': 0.0}
     controller = ArduPlaneFeedForwardController("udp:127.0.0.1:14552", "udp:127.0.0.1:14562", clearances)
     controller.run()
