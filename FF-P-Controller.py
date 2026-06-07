@@ -140,7 +140,7 @@ class ArduPlaneFeedForwardController:
         return (dn * cos_c + de * sin_c), (-dn * sin_c + de * cos_c)
 
     def send_attitude_target(self, roll, pitch, yaw, thrust):
-        q = self.euler_to_quaternion(roll, pitch, yaw)
+        q = self.euler_to_quaternion(roll, pitch, 0)
         self.follower.mav.set_attitude_target_send(
             0, self.follower.target_system, self.follower.target_component,
             _ATTITUDE_ONLY_TYPE_MASK, q, 0, 0, 0, thrust
