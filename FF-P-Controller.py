@@ -25,11 +25,14 @@ class ArduPlaneFeedForwardController:
         self.BASE_THRUST = 0.0834
         self.K_CROSS_HEADING = 0.02
 
-        # --- TURN COMPENSATION (FEED-FORWARD) ---
+        # --- TURN & THROTTLE COMPENSATION (FEED-FORWARD) ---
         self.K_FEEDFORWARD = 0.8 
+        self.K_PITCH_FF = 0.7
+        self.K_THRUST_FF = 0.4
+        
         
         self.MAX_ROLL = math.radians(40)   
-        self.MAX_PITCH = math.radians(10)  
+        self.MAX_PITCH = math.radians(15)  
         
         # Command Smoothing (Low-Pass Filter)
         self.last_roll_cmd = 0.0
@@ -39,7 +42,9 @@ class ArduPlaneFeedForwardController:
         # State tracking
         self.leader_ned = self._empty_ned()
         self.follower_ned = self._empty_ned()
-        self.leader_roll = 0.0  
+        self.leader_roll = 0.0
+        self.leader_pitch = 0.0
+        self.leader_throttle = 0.0  # Normalized (0.0 to 1.0)
         self.has_offset = False
         self.offset = {'n': 0.0, 'e': 0.0, 'd': 0.0}
         
@@ -54,9 +59,10 @@ class ArduPlaneFeedForwardController:
         self.follower.wait_heartbeat()
         print("Follower heartbeat verified.")
         
-        # Request both Position and Attitude streams
+        # Request Position, Attitude, and HUD data streams
         self._request_message_stream(self.leader, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 100_000)
         self._request_message_stream(self.leader, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 50_000) 
+        self._request_message_stream(self.leader, mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD, 50_000)  # For true throttle
         self._request_message_stream(self.follower, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 100_000)
 
     @staticmethod
@@ -101,15 +107,20 @@ class ArduPlaneFeedForwardController:
             handler(msg)
 
     def _handle_leader_msg(self, msg):
-        if msg.get_type() == 'LOCAL_POSITION_NED':
+        msg_type = msg.get_type()
+        if msg_type == 'LOCAL_POSITION_NED':
             self.leader_ned['n'], self.leader_ned['e'], self.leader_ned['d'] = msg.x, msg.y, msg.z
             self.leader_ned['valid'] = True
             speed = math.hypot(msg.vx, msg.vy)
             if speed > 0.5:
                 self.chi_L = math.atan2(msg.vy, msg.vx)
-        elif msg.get_type() == 'ATTITUDE':
+        elif msg_type == 'ATTITUDE':
             self.leader_roll = msg.roll
-            self.chi_L = msg.yaw  
+            self.leader_pitch = msg.pitch
+            self.chi_L = msg.yaw
+        elif msg_type == 'VFR_HUD':
+            # msg.throttle is 0 to 100 integer percent; scale to 0.0 - 1.0 float
+            self.leader_throttle = msg.throttle / 100.0
 
     def _handle_follower_msg(self, msg):
         if msg.get_type() == 'LOCAL_POSITION_NED':
@@ -155,7 +166,7 @@ class ArduPlaneFeedForwardController:
             time.sleep(0.05)
             
         self.set_follower_mode('GUIDED')
-        print("Running predictive loop with Feed-Forward turn compensation.\n")
+        print("Running predictive loop with Feed-Forward turn & leader throttle compensation.\n")
 
         try:
             while True:
@@ -182,58 +193,56 @@ class ArduPlaneFeedForwardController:
                     # ---------------------------------------------------------
                     # 2. Roll Calculation (Vector Pursuit Geometry)
                     # ---------------------------------------------------------
-                    # Calculate the baseline heading directly toward the slot
                     heading_to_slot = math.atan2(slot_e - f_e, slot_n - f_n)
                     heading_to_slot = (heading_to_slot + math.pi) % (2 * math.pi) - math.pi
 
-                    # If the leader is flying straight, we want to match their course 
-                    # and use cross-track error to slide left/right.
                     if abs(self.leader_roll) < math.radians(5.0):
                         MAX_INTERCEPT_ANGLE = math.radians(25) 
                         heading_correction = cross_err * self.K_CROSS_HEADING 
                         heading_correction = max(-MAX_INTERCEPT_ANGLE, min(MAX_INTERCEPT_ANGLE, heading_correction))
                         target_yaw = self.chi_L + heading_correction
-                    
-                    # If the leader is actively turning, matching their heading causes corner cutting.
-                    # Instead, force the follower to steer directly toward the spatial slot coordinates.
                     else:
-                        # Blend the leader's heading with the direct line to the slot based on distance.
-                        # This creates an "elastic tether" to the slot position.
-                        blend_factor = min(1.0, dist_to_slot / 30.0) # 0.0 at slot, 1.0 when 30m away
-                        
-                        # Unroll/unwrap angles safely for linear interpolation
+                        blend_factor = min(1.0, dist_to_slot / 30.0)
                         diff = heading_to_slot - self.chi_L
                         diff = (diff + math.pi) % (2 * math.pi) - math.pi
-                        
                         target_yaw = self.chi_L + (diff * blend_factor)
 
-                    # Normalize target_yaw
                     target_yaw = (target_yaw + math.pi) % (2 * math.pi) - math.pi
 
-                    # Core Heading Tracking Loop
                     heading_error = target_yaw - self.chi_F
                     heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
 
                     feedback_roll = heading_error * self.K_ROLL
-                    
                     feedforward_roll = self.K_FEEDFORWARD * self.leader_roll
 
                     raw_roll = feedback_roll + feedforward_roll
                     raw_roll = max(-self.MAX_ROLL, min(self.MAX_ROLL, raw_roll))
                     # ---------------------------------------------------------
 
-                    # 3. Pitch and Thrust Calculations
+                    # 3. Pitch Calculations
                     alt_error = f['d'] - slot_d 
-                    raw_pitch = max(-self.MAX_PITCH, min(self.MAX_PITCH, alt_error * self.K_PITCH))
+                    feedback_pitch = alt_error * self.K_PITCH    
 
+                    feedforward_pitch = self.K_PITCH_FF * self.leader_pitch
+                    raw_pitch = feedback_pitch + feedforward_pitch
+                    raw_pitch = max(-self.MAX_PITCH, min(self.MAX_PITCH, raw_pitch))               
 
-                    target_thrust = self.BASE_THRUST + (along_err * self.K_THRUST)
-                    
-
-                    # 4. Command Low-Pass Filtering
+                    # 4. Command Low-Pass Filtering & Dynamic Thrust Calculations
                     smoothed_roll = (self.SMOOTHING_ALPHA * raw_roll) + ((1.0 - self.SMOOTHING_ALPHA) * self.last_roll_cmd)
                     smoothed_pitch = (self.SMOOTHING_ALPHA * raw_pitch) + ((1.0 - self.SMOOTHING_ALPHA) * self.last_pitch_cmd)
                     
+                    # Core distance feedback
+                    feedback_thrust = along_err * self.K_THRUST      
+                    
+                    # Turn lift-loss compensation
+                    feedforward_trust = (1.0 / math.cos(smoothed_roll) - 1.0) * self.K_THRUST_FF
+
+                    # True Throttle Feed-Forward: Replaces static self.BASE_THRUST
+
+                    # Combine everything
+                    target_thrust = self.BASE_THRUST + feedback_thrust + feedforward_trust
+                    target_thrust = max(0.0, min(1.0, target_thrust)) 
+
                     self.last_roll_cmd, self.last_pitch_cmd = smoothed_roll, smoothed_pitch
 
                     # Send payload
@@ -243,10 +252,10 @@ class ArduPlaneFeedForwardController:
                     now = time.monotonic()
                     if now - self._last_log_time >= self.log_interval_s:
                         self._last_log_time = now
-                        print(f"Follow Err: {along_err:+5.1f}m | "
-                              f"Cross-Track Err: {cross_err:+5.1f}m | "
-                              f"L_Roll: {math.degrees(self.leader_roll):+05.1f}° | "
-                              f"F_Roll: {math.degrees(smoothed_roll):+05.1f}°")
+                        print(f"Along:{along_err:+5.1f}m Cross:{cross_err:+5.1f}m | "
+                              f"L_Thrust:{self.leader_throttle*100:3.0f}% F_Thrust:{target_thrust*100:3.0f}% | "
+                              f"L_P:{math.degrees(self.leader_pitch):+05.1f}° F_P:{math.degrees(smoothed_pitch):+05.1f}° | "
+                              f"L_A:{-l_d:+06.1f} F_A:{-f['d']:+06.1f}")
 
                 time.sleep(0.05)
 
