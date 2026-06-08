@@ -26,10 +26,13 @@ class ArduPlaneFeedForwardController:
         self.K_CROSS_HEADING = 0.02
 
         # --- TURN COMPENSATION (FEED-FORWARD) ---
-        self.K_FEEDFORWARD = 0.8 
+        self.K_FEEDFORWARD = 0.65 
+
+        self.K_TURN_THRUST = 0.25  # Extra throttle to overcome induced drag
+        self.K_TURN_PITCH = math.radians(60)  # Extra pitch to restore vertical lift
         
         self.MAX_ROLL = math.radians(40)   
-        self.MAX_PITCH = math.radians(10)  
+        self.MAX_PITCH = math.radians(15)  
         
         # Command Smoothing (Low-Pass Filter)
         self.last_roll_cmd = 0.0
@@ -220,18 +223,34 @@ class ArduPlaneFeedForwardController:
 
                     raw_roll = feedback_roll + feedforward_roll
                     raw_roll = max(-self.MAX_ROLL, min(self.MAX_ROLL, raw_roll))
+                    smoothed_roll = (self.SMOOTHING_ALPHA * raw_roll) + ((1.0 - self.SMOOTHING_ALPHA) * self.last_roll_cmd)
                     # ---------------------------------------------------------
 
                     # 3. Pitch and Thrust Calculations
                     alt_error = f['d'] - slot_d 
-                    raw_pitch = max(-self.MAX_PITCH, min(self.MAX_PITCH, alt_error * self.K_PITCH))
+                    
+                    # Constrain cos(roll) to prevent division by zero or extreme spikes
+                    cos_roll = max(math.cos(smoothed_roll), 0.5) 
 
+                    # A. TECS Thrust Compensation: Induced drag increases with 1/cos^2(roll)
+                    drag_comp = (1.0 / (cos_roll ** 2)) - 1.0
+                    turn_thrust_ff = drag_comp * self.K_TURN_THRUST
 
-                    target_thrust = self.BASE_THRUST + (along_err * self.K_THRUST)
+                    # B. Lift Compensation: Vertical lift decreases by cos(roll)
+                    lift_comp = (1.0 / cos_roll) - 1.0
+                    turn_pitch_ff = lift_comp * self.K_TURN_PITCH
+
+                    # Combine altitude error feedback with turn feed-forward pitch
+                    raw_pitch = (alt_error * self.K_PITCH) + turn_pitch_ff
+                    raw_pitch = max(-self.MAX_PITCH, min(self.MAX_PITCH, raw_pitch))
+
+                    # Combine along-track error feedback with turn feed-forward thrust
+                    target_thrust = self.BASE_THRUST + (along_err * self.K_THRUST) + turn_thrust_ff
+                    target_thrust = max(0.0, min(1.0, target_thrust)) # Clamp thrust between 0 and 1
                     
 
                     # 4. Command Low-Pass Filtering
-                    smoothed_roll = (self.SMOOTHING_ALPHA * raw_roll) + ((1.0 - self.SMOOTHING_ALPHA) * self.last_roll_cmd)
+                    
                     smoothed_pitch = (self.SMOOTHING_ALPHA * raw_pitch) + ((1.0 - self.SMOOTHING_ALPHA) * self.last_pitch_cmd)
                     
                     self.last_roll_cmd, self.last_pitch_cmd = smoothed_roll, smoothed_pitch
