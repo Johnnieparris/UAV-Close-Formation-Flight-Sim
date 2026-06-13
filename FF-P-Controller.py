@@ -21,15 +21,28 @@ class ArduPlaneFeedForwardController:
         # --- TUNED CONTROLLER GAINS ---
         self.K_ROLL = 0.4
         self.K_PITCH = 0.02
-        self.K_THRUST = 0.006
-        self.BASE_THRUST = 0.0834
         self.K_CROSS_HEADING = 0.02
+
+        # --- CASCADED LONGITUDINAL GAINS ---
+        self.BASE_THRUST = 0.0834
+        
+        # Outer Loop: How aggressively to adjust speed based on position error
+        self.K_P_ALONG = 0.4  
+        
+        # Inner Loop: Speed Error to Thrust PI Controller
+        self.K_P_VEL = 0.05    
+        self.K_I_VEL = 0.015   
+        
+        # Integrator state for velocity PI loop
+        self.vel_integrator = 0.0
+        self.MAX_VEL_INTEGRATOR = 0.25 # Anti-windup cap
+        self.dt = 0.05 # Loop timing approximation
 
         # --- TURN COMPENSATION (FEED-FORWARD) ---
         self.K_FEEDFORWARD = 0.65 
 
         self.K_TURN_THRUST = 0.25  # Extra throttle to overcome induced drag
-        self.K_TURN_PITCH = math.radians(60)  # Extra pitch to restore vertical lift
+        self.K_TURN_PITCH = math.radians(40)  # Extra pitch to restore vertical lift
         
         self.MAX_ROLL = math.radians(40)   
         self.MAX_PITCH = math.radians(15)  
@@ -106,6 +119,7 @@ class ArduPlaneFeedForwardController:
     def _handle_leader_msg(self, msg):
         if msg.get_type() == 'LOCAL_POSITION_NED':
             self.leader_ned['n'], self.leader_ned['e'], self.leader_ned['d'] = msg.x, msg.y, msg.z
+            self.leader_ned['vn'], self.leader_ned['ve'] = msg.vx, msg.vy
             self.leader_ned['valid'] = True
             speed = math.hypot(msg.vx, msg.vy)
             if speed > 0.5:
@@ -117,6 +131,7 @@ class ArduPlaneFeedForwardController:
     def _handle_follower_msg(self, msg):
         if msg.get_type() == 'LOCAL_POSITION_NED':
             self.follower_ned['n'], self.follower_ned['e'], self.follower_ned['d'] = msg.x, msg.y, msg.z
+            self.follower_ned['vn'], self.follower_ned['ve'] = msg.vx, msg.vy
             self.follower_ned['valid'] = True
             speed = math.hypot(msg.vx, msg.vy)
             if speed > 0.5:
@@ -155,10 +170,10 @@ class ArduPlaneFeedForwardController:
             self._drain_messages(self.follower, self._handle_follower_msg)
             if not self.has_offset and self.leader_ned['valid'] and self.follower_ned['valid']:
                 self._sync_offset()
-            time.sleep(0.05)
+            time.sleep(self.dt)
             
         self.set_follower_mode('GUIDED')
-        print("Running predictive loop with Feed-Forward turn compensation.\n")
+        print("Running predictive loop with Cascaded Feed-Forward velocity & turn compensation.\n")
 
         try:
             while True:
@@ -185,40 +200,26 @@ class ArduPlaneFeedForwardController:
                     # ---------------------------------------------------------
                     # 2. Roll Calculation (Vector Pursuit Geometry)
                     # ---------------------------------------------------------
-                    # Calculate the baseline heading directly toward the slot
                     heading_to_slot = math.atan2(slot_e - f_e, slot_n - f_n)
                     heading_to_slot = (heading_to_slot + math.pi) % (2 * math.pi) - math.pi
 
-                    # If the leader is flying straight, we want to match their course 
-                    # and use cross-track error to slide left/right.
                     if abs(self.leader_roll) < math.radians(5.0):
                         MAX_INTERCEPT_ANGLE = math.radians(25) 
                         heading_correction = cross_err * self.K_CROSS_HEADING 
                         heading_correction = max(-MAX_INTERCEPT_ANGLE, min(MAX_INTERCEPT_ANGLE, heading_correction))
                         target_yaw = self.chi_L + heading_correction
-                    
-                    # If the leader is actively turning, matching their heading causes corner cutting.
-                    # Instead, force the follower to steer directly toward the spatial slot coordinates.
                     else:
-                        # Blend the leader's heading with the direct line to the slot based on distance.
-                        # This creates an "elastic tether" to the slot position.
-                        blend_factor = min(1.0, dist_to_slot / 30.0) # 0.0 at slot, 1.0 when 30m away
-                        
-                        # Unroll/unwrap angles safely for linear interpolation
+                        blend_factor = min(1.0, dist_to_slot / 30.0) 
                         diff = heading_to_slot - self.chi_L
                         diff = (diff + math.pi) % (2 * math.pi) - math.pi
-                        
                         target_yaw = self.chi_L + (diff * blend_factor)
 
-                    # Normalize target_yaw
                     target_yaw = (target_yaw + math.pi) % (2 * math.pi) - math.pi
 
-                    # Core Heading Tracking Loop
                     heading_error = target_yaw - self.chi_F
                     heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
 
                     feedback_roll = heading_error * self.K_ROLL
-                    
                     feedforward_roll = self.K_FEEDFORWARD * self.leader_roll
 
                     raw_roll = feedback_roll + feedforward_roll
@@ -229,14 +230,13 @@ class ArduPlaneFeedForwardController:
                     # 3. Pitch and Thrust Calculations
                     alt_error = f['d'] - slot_d 
                     
-                    # Constrain cos(roll) to prevent division by zero or extreme spikes
                     cos_roll = max(math.cos(smoothed_roll), 0.5) 
 
-                    # A. TECS Thrust Compensation: Induced drag increases with 1/cos^2(roll)
+                    # A. TECS Thrust Compensation (Induced drag)
                     drag_comp = (1.0 / (cos_roll ** 2)) - 1.0
                     turn_thrust_ff = drag_comp * self.K_TURN_THRUST
 
-                    # B. Lift Compensation: Vertical lift decreases by cos(roll)
+                    # B. Lift Compensation (Vertical lift)
                     lift_comp = (1.0 / cos_roll) - 1.0
                     turn_pitch_ff = lift_comp * self.K_TURN_PITCH
 
@@ -244,15 +244,28 @@ class ArduPlaneFeedForwardController:
                     raw_pitch = (alt_error * self.K_PITCH) + turn_pitch_ff
                     raw_pitch = max(-self.MAX_PITCH, min(self.MAX_PITCH, raw_pitch))
 
-                    # Combine along-track error feedback with turn feed-forward thrust
-                    target_thrust = self.BASE_THRUST + (along_err * self.K_THRUST) + turn_thrust_ff
-                    target_thrust = max(0.0, min(1.0, target_thrust)) # Clamp thrust between 0 and 1
-                    
+                    # --- NEW CASCADED THRUST CONTROLLER ---
+                    l_speed = math.hypot(self.leader_ned['vn'], self.leader_ned['ve'])
+                    f_speed = math.hypot(self.follower_ned['vn'], self.follower_ned['ve'])
+
+                    # Outer Loop: Target Velocity
+                    target_speed = l_speed + (along_err * self.K_P_ALONG)
+                    MAX_SPEED_DELTA = 5.0 
+                    target_speed = max(l_speed - MAX_SPEED_DELTA, min(l_speed + MAX_SPEED_DELTA, target_speed))
+
+                    # Inner Loop: Velocity Error to Thrust (PI Controller)
+                    speed_error = target_speed - f_speed
+                    self.vel_integrator += speed_error * self.dt
+                    self.vel_integrator = max(-self.MAX_VEL_INTEGRATOR, min(self.MAX_VEL_INTEGRATOR, self.vel_integrator))
+
+                    thrust_adjustment = (speed_error * self.K_P_VEL) + (self.vel_integrator * self.K_I_VEL)
+
+                    # Final Combination
+                    target_thrust = self.BASE_THRUST + thrust_adjustment + turn_thrust_ff
+                    target_thrust = max(0.0, min(1.0, target_thrust)) 
 
                     # 4. Command Low-Pass Filtering
-                    
                     smoothed_pitch = (self.SMOOTHING_ALPHA * raw_pitch) + ((1.0 - self.SMOOTHING_ALPHA) * self.last_pitch_cmd)
-                    
                     self.last_roll_cmd, self.last_pitch_cmd = smoothed_roll, smoothed_pitch
 
                     # Send payload
@@ -263,11 +276,11 @@ class ArduPlaneFeedForwardController:
                     if now - self._last_log_time >= self.log_interval_s:
                         self._last_log_time = now
                         print(f"Follow Err: {along_err:+5.1f}m | "
-                              f"Cross-Track Err: {cross_err:+5.1f}m | "
+                              f"Speed Err: {speed_error:+4.1f}m/s | "
                               f"L_Roll: {math.degrees(self.leader_roll):+05.1f}° | "
                               f"F_Roll: {math.degrees(smoothed_roll):+05.1f}°")
 
-                time.sleep(0.05)
+                time.sleep(self.dt)
 
         except KeyboardInterrupt:
             print("\nShutting down controller.")
