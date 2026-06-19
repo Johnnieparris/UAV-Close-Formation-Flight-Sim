@@ -20,6 +20,10 @@ class ArduPlaneFeedForwardController:
 
         # --- TUNED CONTROLLER GAINS ---
         self.K_ROLL = 0.4
+        self.K_I_ROLL = 0.1           # Roll Integrator Gain
+        self.roll_integrator = 0.0     # Integrator state
+        self.MAX_ROLL_INTEGRATOR = math.radians(10) # Max allow 10° of trim correction
+        
         self.K_PITCH = 0.02
         self.K_CROSS_HEADING = 0.02
 
@@ -36,13 +40,13 @@ class ArduPlaneFeedForwardController:
         # Integrator state for velocity PI loop
         self.vel_integrator = 0.0
         self.MAX_VEL_INTEGRATOR = 0.25 # Anti-windup cap
-        self.dt = 0.05 # Loop timing approximation
+        self.dt = 0.05 # Initial fallback, will be calculated dynamically
 
         # --- TURN COMPENSATION (FEED-FORWARD) ---
-        self.K_FEEDFORWARD = 0.65 
+        self.K_FEEDFORWARD = 0.70 
 
-        self.K_TURN_THRUST = 0.25  # Extra throttle to overcome induced drag
-        self.K_TURN_PITCH = math.radians(40)  # Extra pitch to restore vertical lift
+        self.K_TURN_THRUST = 0.25  # Extra throttle to overcome induced drag (lowered)
+        self.K_TURN_PITCH = math.radians(20)  # Extra pitch to restore vertical lift
         
         self.MAX_ROLL = math.radians(40)   
         self.MAX_PITCH = math.radians(15)  
@@ -170,13 +174,21 @@ class ArduPlaneFeedForwardController:
             self._drain_messages(self.follower, self._handle_follower_msg)
             if not self.has_offset and self.leader_ned['valid'] and self.follower_ned['valid']:
                 self._sync_offset()
-            time.sleep(self.dt)
+            time.sleep(0.05)
             
         self.set_follower_mode('GUIDED')
-        print("Running predictive loop with Cascaded Feed-Forward velocity & turn compensation.\n")
+        print("Running predictive loop with Cascaded FF, Turn FF, and Roll Trim Integration.\n")
+
+        # Initialize loop timer
+        last_time = time.monotonic()
 
         try:
             while True:
+                # 0. Calculate actual delta time for integrators
+                now = time.monotonic()
+                self.dt = max(0.001, now - last_time) # Protect against zero-division
+                last_time = now
+
                 self._drain_messages(self.leader, self._handle_leader_msg)
                 self._drain_messages(self.follower, self._handle_follower_msg)
 
@@ -219,7 +231,15 @@ class ArduPlaneFeedForwardController:
                     heading_error = target_yaw - self.chi_F
                     heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
 
-                    feedback_roll = heading_error * self.K_ROLL
+                    # --- ROLL INTEGRATOR (Anti-Windup Protected) ---
+                    # Only accumulate integral when not actively in a hard maneuver
+                    if abs(self.leader_roll) < math.radians(15.0):
+                        self.roll_integrator += heading_error * self.dt
+                        self.roll_integrator = max(-self.MAX_ROLL_INTEGRATOR, min(self.MAX_ROLL_INTEGRATOR, self.roll_integrator))
+
+                    # Combine Proportional and Integral terms
+                    feedback_roll = (heading_error * self.K_ROLL) + (self.roll_integrator * self.K_I_ROLL)
+                    
                     feedforward_roll = self.K_FEEDFORWARD * self.leader_roll
 
                     raw_roll = feedback_roll + feedforward_roll
@@ -244,7 +264,7 @@ class ArduPlaneFeedForwardController:
                     raw_pitch = (alt_error * self.K_PITCH) + turn_pitch_ff
                     raw_pitch = max(-self.MAX_PITCH, min(self.MAX_PITCH, raw_pitch))
 
-                    # --- NEW CASCADED THRUST CONTROLLER ---
+                    # --- CASCADED THRUST CONTROLLER ---
                     l_speed = math.hypot(self.leader_ned['vn'], self.leader_ned['ve'])
                     f_speed = math.hypot(self.follower_ned['vn'], self.follower_ned['ve'])
 
@@ -272,20 +292,20 @@ class ArduPlaneFeedForwardController:
                     self.send_attitude_target(smoothed_roll, smoothed_pitch, target_yaw, target_thrust)
 
                     # 5. Updated Telemetry Diagnostics Log
-                    now = time.monotonic()
                     if now - self._last_log_time >= self.log_interval_s:
                         self._last_log_time = now
                         print(f"Follow Err: {along_err:+5.1f}m | "
+                              f"Cross Err: {cross_err:+5.1f}m | "
                               f"Speed Err: {speed_error:+4.1f}m/s | "
-                              f"L_Roll: {math.degrees(self.leader_roll):+05.1f}° | "
-                              f"F_Roll: {math.degrees(smoothed_roll):+05.1f}°")
+                              f"Roll Trim: {math.degrees(self.roll_integrator):+04.1f}°")
 
-                time.sleep(self.dt)
+                # Fixed sleep interval to keep loop CPU usage low
+                time.sleep(0.05)
 
         except KeyboardInterrupt:
             print("\nShutting down controller.")
 
 if __name__ == "__main__":
-    clearances = {'f_c': 10.0, 'l_c': 0.0, 'v_c': 0.0}
+    clearances = {'f_c': 10.0, 'l_c': 0.0, 'v_c': -2.0}
     controller = ArduPlaneFeedForwardController("udp:127.0.0.1:14552", "udp:127.0.0.1:14562", clearances)
     controller.run()
