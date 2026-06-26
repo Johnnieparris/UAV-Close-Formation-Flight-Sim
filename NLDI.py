@@ -288,31 +288,33 @@ class CascadedFormationController:
                         l_speed = math.hypot(self.leader_ned['vn'], self.leader_ned['ve'])
                         f_speed = math.hypot(self.follower_ned['vn'], self.follower_ned['ve'])
 
-                        # --- NEW: KINEMATIC WINGMAN COMPENSATION ---
-                        # Calculate leader's turn rate (rad/s) using coordinated turn physics: omega = g * tan(roll) / V
+                        # Estimate leader yaw rate from coordinated turn physics: omega = g * tan(roll) / V
                         turn_rate_leader = (self.GRAVITY / max(l_speed, 1.0)) * math.tan(self.leader_roll)
 
-                        # Dynamic feedforward base speed: V_slot = V_leader - (omega * lateral_offset)
-                        # (Subtracted because a positive roll/turn_rate means a right turn, making a right-wingman fly the inner radius)
-                        wingman_base_speed = l_speed - (turn_rate_leader * self.l_c)
-                        # --------------------------------------------
+                        # Desired slot velocity = leader velocity + rotational velocity of the offset point.
+                        # This gives the follower the velocity needed to stay rigidly attached during turns.
+                        slot_vn = self.leader_ned['vn'] + turn_rate_leader * (self.f_c * sin_c - self.l_c * cos_c)
+                        slot_ve = self.leader_ned['ve'] + turn_rate_leader * (-self.f_c * cos_c - self.l_c * sin_c)
 
-                        # Apply proportional position feedback to the adjusted kinematic base speed
-                        target_along_vel = wingman_base_speed + (along_err * self.K_P_POS_ALONG) + (along_err_dot * self.K_D_POS_ALONG)
+                        slot_along_vel = slot_vn * cos_c + slot_ve * sin_c
+                        slot_cross_vel = -slot_vn * sin_c + slot_ve * cos_c
+
+                        # Apply proportional position feedback around the moving slot velocity.
+                        target_along_vel = slot_along_vel + (along_err * self.K_P_POS_ALONG) + (along_err_dot * self.K_D_POS_ALONG)
 
                         # Constrain the target speed relative to the leader's actual speed
                         target_along_vel = max(l_speed - self.MAX_SPEED_DELTA, min(l_speed + self.MAX_SPEED_DELTA, target_along_vel))
 
-                        target_cross_vel = cross_err * self.K_P_POS_CROSS
+                        target_cross_vel = slot_cross_vel + (cross_err * self.K_P_POS_CROSS)
                         target_vert_vel  = self.leader_ned['vd'] + (err_d * self.K_P_POS_VERT)
 
-                        # Required Accelerations
-                        accel_along = (target_along_vel - f_speed) * self.K_P_VEL
-                        
-                        # --- CROSS-TRACK ACCELERATION BREAKDOWN FOR DIAGNOSTICS ---
                         current_along_vel = self.follower_ned['vn'] * cos_c + self.follower_ned['ve'] * sin_c
                         current_cross_vel = -self.follower_ned['vn'] * sin_c + self.follower_ned['ve'] * cos_c
+
+                        # Required Accelerations
+                        accel_along = (target_along_vel - current_along_vel) * self.K_P_VEL
                         
+                        # --- CROSS-TRACK ACCELERATION BREAKDOWN FOR DIAGNOSTICS ---
                         # 1. Proportional feedback component (based on position and velocity tracking errors)
                         accel_cross_feedback = (target_cross_vel - current_cross_vel) * self.K_P_VEL
                         

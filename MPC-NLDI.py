@@ -1,270 +1,157 @@
 import time
 import math
 import numpy as np
+from scipy.optimize import minimize
 from pymavlink import mavutil
+
+import multiprocessing
+import matplotlib.pyplot as plt
+from collections import deque
+
+def run_visualizer(data_queue):
+    """Runs in a separate process to handle real-time plotting."""
+    plt.style.use('dark_background')
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    ax_spd, ax_roll, ax_vert = axes
+    fig.suptitle("MPC Outer Loop Commands vs Follower Response", fontsize=14, color='white')
+
+    max_history = 100
+    time_hist = deque(maxlen=max_history)
+    
+    target_spd_hist = deque(maxlen=max_history)
+    actual_spd_hist = deque(maxlen=max_history)
+    
+    target_roll_hist = deque(maxlen=max_history)
+    actual_roll_hist = deque(maxlen=max_history)
+    
+    target_vert_hist = deque(maxlen=max_history)
+    actual_vert_hist = deque(maxlen=max_history)
+
+    t_start = time.time()
+
+    while plt.fignum_exists(fig.number):
+        data = None
+        while not data_queue.empty():
+            try:
+                data = data_queue.get_nowait()
+            except Exception:
+                break
+
+        if data is not None:
+            time_hist.append(time.time() - t_start)
+            
+            target_spd_hist.append(data['target_speed'])
+            actual_spd_hist.append(data['actual_speed'])
+            
+            target_roll_hist.append(math.degrees(data['target_roll']))
+            actual_roll_hist.append(math.degrees(data['actual_roll']))
+            
+            target_vert_hist.append(data['target_vert_vel'])
+            actual_vert_hist.append(data['actual_vert_vel'])
+
+            time_values = list(time_hist)
+
+            for ax in axes:
+                ax.clear()
+                ax.grid(True, color='gray', alpha=0.3)
+
+            ax_spd.plot(time_values, list(target_spd_hist), 'y-', label='MPC Cmd Speed ($v^c$)')
+            ax_spd.plot(time_values, list(actual_spd_hist), 'c--', label='Follower Actual ($v$)')
+            ax_spd.set_title("Speed Tracking")
+            ax_spd.set_ylabel("Speed (m/s)")
+            ax_spd.legend(loc='upper left')
+
+            ax_roll.plot(time_values, list(target_roll_hist), 'y-', label='MPC Cmd Roll ($\gamma^c$)')
+            ax_roll.plot(time_values, list(actual_roll_hist), 'c--', label='Follower Actual ($\gamma$)')
+            ax_roll.set_title("Roll Tracking (Coordinated Turn)")
+            ax_roll.set_ylabel("Bank Angle (deg)")
+            ax_roll.legend(loc='upper left')
+
+            ax_vert.plot(time_values, list(target_vert_hist), 'y-', label='P-Loop Cmd Vel')
+            ax_vert.plot(time_values, list(actual_vert_hist), 'c--', label='Follower Actual Vel')
+            ax_vert.set_title("Vertical Velocity Tracking (Decoupled)")
+            ax_vert.set_xlabel("Time (s)")
+            ax_vert.set_ylabel("Velocity (m/s)")
+            ax_vert.legend(loc='upper left')
+
+            plt.pause(0.01) 
+
+        time.sleep(0.02) 
 
 _ATTITUDE_ONLY_TYPE_MASK = 0b00000111
 
-
-# ---------------------------------------------------------------------------
-# Lightweight Kinematic MPC
-# ---------------------------------------------------------------------------
-# State:  x = [along_pos, cross_pos, vert_pos]   (formation body frame)
-# Input:  u = [v_along, v_cross, v_vert]          (desired velocity commands)
-#
-# Dynamics (Euler, dt):
-#   x[k+1] = x[k] + dt * (u[k] - v_leader_body[k])
-#
-# Because the slot rotates with the leader's heading, we re-express the
-# leader's NED velocity in formation-body frame at each prediction step,
-# effectively giving us a linear, time-varying (but pre-computable) model.
-#
-# Cost:    J = sum_{k=1}^{N} x[k]'Qx[k] + sum_{k=0}^{N-1} u[k]'Ru[k]
-#              + x[N]'P_f x[N]
-#
-# Solved analytically via batch least-squares (O(N) build, O(n^3) solve once
-# per loop with n = 3N — cheap at N <= 20 and 3 states).
-# ---------------------------------------------------------------------------
-
-class KinematicMPC:
-    """
-    Receding-horizon kinematic MPC for one follower UAV.
-
-    Parameters
-    ----------
-    N       : prediction horizon (steps)
-    dt      : sample time (s) — must match outer-loop rate
-    Q       : 3x3 state cost matrix (position tracking)
-    R       : 3x3 input cost matrix (velocity effort)
-    P_f     : 3x3 terminal state cost (>= Q recommended for stability)
-    v_max   : maximum allowed speed command per axis (m/s)
-    """
-
-    def __init__(self, N=10, dt=0.05, Q=None, R=None, P_f=None, v_max=8.0):
-        self.N    = N
-        self.dt   = dt
-        self.v_max = v_max
-
-        # Default cost matrices (diagonal, tunable)
-        self.Q   = Q   if Q   is not None else np.diag([1.2, 2.0, 3.0])
-        self.R   = R   if R   is not None else np.diag([0.3, 0.4, 0.2])
-        self.P_f = P_f if P_f is not None else np.diag([3.0, 5.0, 6.0])
-
-    def _build_batch_matrices(self, leader_body_velocities):
-        """
-        Build the batch prediction matrices Phi and Gamma such that
-            X = Phi * x0 + Gamma * U
-        where X stacks [x1, x2, ..., xN] and U stacks [u0, ..., u_{N-1}].
-
-        leader_body_velocities : list of N np.array([vl_along, vl_cross, vl_vert])
-        """
-        n, m, N, dt = 3, 3, self.N, self.dt
-
-        # Phi maps initial state to free response
-        Phi = np.zeros((N * n, n))
-        # Gamma maps inputs to constrained response
-        Gamma = np.zeros((N * n, N * m))
-
-        A = np.eye(n)  # State transition (identity — pure integrator kinematics)
-
-        A_pow = np.eye(n)
-        for k in range(N):
-            A_pow = A_pow @ A  # stays identity here; kept for easy extension
-            Phi[k*n:(k+1)*n, :] = A_pow
-
-        for k in range(N):
-            # Influence of u_j on x_{k+1}
-            for j in range(k + 1):
-                step_power = k - j
-                A_pow_ij = np.eye(n)  # A^(step_power) — identity for integrator
-                B_eff = dt * A_pow_ij  # B = dt*I, already in body frame
-                Gamma[k*n:(k+1)*n, j*m:(j+1)*m] += B_eff
-
-        # Disturbance offset: leader velocity integrated forward creates a
-        # "drift" that the MPC must counteract. We fold it into the reference.
-        # d[k] = -dt * v_leader_body[k]  (slot moves with leader)
-        D = np.zeros(N * n)
-        A_pow = np.eye(n)
-        for k in range(N):
-            # Accumulate disturbance from step j onto state k+1
-            for j in range(k + 1):
-                step = k - j
-                # Each disturbance d[j] propagates A^step steps
-                D[k*n:(k+1)*n] += (-dt) * leader_body_velocities[j]
-
-        return Phi, Gamma, D
-
-    def _build_cost_matrices(self):
-        """Stack Q, R, P_f into block-diagonal matrices for the batch problem."""
-        n, m, N = 3, 3, self.N
-        Q_bar = np.zeros((N * n, N * n))
-        R_bar = np.zeros((N * m, N * m))
-
-        for k in range(N - 1):
-            Q_bar[k*n:(k+1)*n, k*n:(k+1)*n] = self.Q
-        # Terminal cost on last state
-        Q_bar[(N-1)*n:N*n, (N-1)*n:N*n] = self.P_f
-
-        for k in range(N):
-            R_bar[k*m:(k+1)*m, k*m:(k+1)*m] = self.R
-
-        return Q_bar, R_bar
-
-    def compute(self, x0, leader_body_velocities):
-        """
-        Solve one MPC step.
-
-        Parameters
-        ----------
-        x0                    : np.array([along_err, cross_err, vert_err])
-                                Current position error in formation body frame.
-        leader_body_velocities: list of N np.array([vl_along, vl_cross, vl_vert])
-                                Leader velocity projected into formation body frame
-                                for each prediction step (can repeat current if
-                                leader heading is assumed constant).
-
-        Returns
-        -------
-        u_opt : np.array([v_along_cmd, v_cross_cmd, v_vert_cmd])
-                First optimal velocity command to apply (receding horizon).
-        predicted_errors : list of N np.array  (for diagnostics)
-        """
-        N, n, m = self.N, 3, 3
-
-        Phi, Gamma, D = self._build_batch_matrices(leader_body_velocities)
-        Q_bar, R_bar  = self._build_cost_matrices()
-
-        # Free response (what happens with U=0 due to disturbance)
-        X_free = Phi @ x0 + D
-
-        # Unconstrained QP: dJ/dU = 0
-        # J = (Gamma U + X_free)' Q_bar (Gamma U + X_free) + U' R_bar U
-        # => (Gamma' Q_bar Gamma + R_bar) U = -Gamma' Q_bar X_free
-        H = Gamma.T @ Q_bar @ Gamma + R_bar
-        g = Gamma.T @ Q_bar @ X_free
-
-        # Solve via Cholesky (H is symmetric positive definite)
-        try:
-            U_opt = np.linalg.solve(H, -g)
-        except np.linalg.LinAlgError:
-            # Fallback to least-squares if H is ill-conditioned
-            U_opt, _, _, _ = np.linalg.lstsq(H, -g, rcond=None)
-
-        # Extract first control action (receding horizon principle)
-        u_opt = U_opt[:m]
-
-        # Clamp to velocity limits
-        u_opt = np.clip(u_opt, -self.v_max, self.v_max)
-
-        # Predicted state trajectory (for diagnostics)
-        X_pred = Gamma @ U_opt + X_free
-        predicted_errors = [X_pred[k*n:(k+1)*n] for k in range(N)]
-
-        return u_opt, predicted_errors
-
-    def update_dt(self, dt):
-        """Update sample time (call if dt varies significantly)."""
-        self.dt = max(0.001, dt)
-
-
-# ---------------------------------------------------------------------------
-# Main Controller
-# ---------------------------------------------------------------------------
-
 class CascadedFormationController:
-    def __init__(self, leader_port, follower_port, offsets):
+    def __init__(self, leader_port, follower_port, offsets, visualizer_queue=None):
+        self.vis_queue = visualizer_queue
         print(f"Connecting to Leader on {leader_port}...")
         self.leader = mavutil.mavlink_connection(leader_port)
 
         print(f"Connecting to Follower on {follower_port}...")
         self.follower = mavutil.mavlink_connection(follower_port)
 
-        # Formation geometry offsets (meters, formation body frame)
-        # f_c = forward clearance, l_c = lateral clearance, v_c = vertical
-        self.f_c = offsets.get('f_c', 0.0)
-        self.l_c = offsets.get('l_c', 0.0)
-        self.v_c = offsets.get('v_c', 0.0)
+        # Formation geometry offsets (Meters)
+        self.f_c = offsets.get('f_c', 0.0) 
+        self.l_c = offsets.get('l_c', 0.0) 
+        self.v_c = offsets.get('v_c', 0.0) 
 
-        # --- PHYSICAL AIRCRAFT PARAMETERS ---
-        self.AIRCRAFT_MASS        = 5.9
-        self.WING_AREA            = 0.982
-        self.AIR_DENSITY          = 1.225
-        self.CD_0                 = 0.028
-        self.CD_ALPHA             = 0.04
-        self.CL_0                 = 0.25
-        self.CL_ALPHA             = 5.0
-        self.MAX_THRUST_NEWTONS   = 38.9
-        self.GRAVITY              = 9.81
+        # --- PHYSICAL & INNER LOOP PARAMETERS ---
+        self.AIRCRAFT_MASS = 5.9       
+        self.WING_AREA = 0.982           
+        self.AIR_DENSITY = 1.225       
+        self.CD_0 = 0.028               
+        self.MAX_THRUST_NEWTONS = 38.9 
+        self.GRAVITY = 9.81            
+        
+        self.K_P_POS_VERT  = 0.9
+        self.K_P_VEL = 0.6
+        self.MAX_PITCH = math.radians(20)
 
-        # --- MPC OUTER LOOP ---
-        # Horizon: 10 steps at 50ms = 0.5s look-ahead.
-        # Increase N (e.g. 20) for tighter formation in sustained turns at the
-        # cost of ~4x solve time (still <1ms on any modern CPU).
-        #
-        # Cost weights:
-        #   Q  — penalises position error [along, cross, vert]
-        #        Higher cross/vert keeps tight lateral & altitude formation.
-        #   R  — penalises velocity effort (smooth commands, lower = more
-        #        aggressive corrections).
-        #   P_f — terminal weight; set >= Q for recursive feasibility.
-        self.mpc = KinematicMPC(
-            N    = 10,
-            dt   = 0.05,
-            Q    = np.diag([1.2, 2.5, 4.0]),   # [along, cross, vert]
-            R    = np.diag([0.4, 0.5, 0.25]),
-            P_f  = np.diag([3.0, 6.0, 8.0]),
-            v_max= 8.0,
+        # --- MPC PARAMETERS (paper-aligned outer loop) ---
+        self.N_horizon = 8
+        self.dt_mpc = 0.5
+        self.a_v = 3.2
+        self.a_gamma = 0.6
+
+        self.Q_pos = 1.0
+        self.Q_speed = 0.05
+        self.Q_heading = 0.5
+        self.RHO_SPEED = 5
+        self.RHO_ROLL = 500
+
+        self.MAX_SPEED = 30.0
+        self.MIN_SPEED = 10.0
+        self.MAX_SPEED_RATE = 5.0
+        self.MAX_ROLL_MPC = math.radians(30)
+
+        # Optimizer state (warm start)
+        self.last_commanded_speed = 0.5 * (self.MIN_SPEED + self.MAX_SPEED)
+        self.last_optimal_u = np.tile(
+            np.array([self.last_commanded_speed, 0.0]),
+            self.N_horizon
         )
 
-        # Feedforward turn gain (blended into MPC via leader vel prediction)
-        self.K_TURN_FEEDFORWARD = 0.9
-
-        # --- INNER LOOP: NLDI GAINS (unchanged from original) ---
-        self.K_P_VEL = 0.6
-
-        # Limiters
-        self.MAX_ROLL        = math.radians(45)
-        self.MAX_PITCH       = math.radians(20)
-        self.MAX_SPEED_DELTA = 5.0
-
-        # State
-        self.leader_ned   = self._empty_ned()
+        # State tracking
+        self.leader_ned = self._empty_ned()
         self.follower_ned = self._empty_ned()
-        self.leader_roll  = 0.0
-        self.has_offset   = False
-        self.offset       = {'n': 0.0, 'e': 0.0, 'd': 0.0}
-        self.chi_L        = 0.0
-        self.chi_F        = 0.0
-        self.dt           = 0.05
-
-        self._last_log_time = 0.0
-        self.log_interval_s = 0.5
-
-        # Leader heading rate estimate (for MPC prediction of future chi_L)
-        self._prev_chi_L     = 0.0
-        self._chi_dot_L      = 0.0   # rad/s — low-pass filtered
-        self._CHI_DOT_ALPHA  = 0.15  # LP filter coefficient (lower = smoother)
+        self.leader_roll = 0.0  
+        self.follower_roll = 0.0
+        self.has_offset = False
+        self.offset = {'n': 0.0, 'e': 0.0, 'd': 0.0}
+        self.chi_L = 0.0  
+        self.chi_F = 0.0  
+        self.dt = 0.05
 
         self.leader.wait_heartbeat()
-        print("Leader heartbeat verified.")
         self.follower.wait_heartbeat()
-        print("Follower heartbeat verified.")
-
-        self._request_message_stream(
-            self.leader, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 100_000)
-        self._request_message_stream(
-            self.leader, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 50_000)
-        self._request_message_stream(
-            self.follower, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 100_000)
-
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
+        
+        self._request_message_stream(self.leader, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 100_000)
+        self._request_message_stream(self.leader, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 50_000) 
+        self._request_message_stream(self.follower, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 100_000)
+        self._request_message_stream(self.follower, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 50_000) 
 
     @staticmethod
     def _empty_ned():
-        return {'n': 0.0, 'e': 0.0, 'd': 0.0,
-                'vn': 0.0, 've': 0.0, 'vd': 0.0, 'valid': False}
+        return {'n': 0.0, 'e': 0.0, 'd': 0.0, 'vn': 0.0, 've': 0.0, 'vd': 0.0, 'valid': False}
 
     @staticmethod
     def euler_to_quaternion(roll, pitch, yaw):
@@ -275,7 +162,7 @@ class CascadedFormationController:
             cr * cp * cy + sr * sp * sy,
             sr * cp * cy - cr * sp * sy,
             cr * sp * cy + sr * cp * sy,
-            cr * cp * sy - sr * sp * cy,
+            cr * cp * sy - sr * sp * cy
         ]
 
     def _request_message_stream(self, link, msg_id, interval_us):
@@ -291,7 +178,7 @@ class CascadedFormationController:
             self.follower.mav.set_mode_send(
                 self.follower.target_system,
                 mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                mode_id,
+                mode_id
             )
 
     def _drain_messages(self, link, handler):
@@ -302,247 +189,268 @@ class CascadedFormationController:
             handler(msg)
 
     def _handle_leader_msg(self, msg):
-        t = msg.get_type()
-        if t == 'LOCAL_POSITION_NED':
-            self.leader_ned.update({
-                'n': msg.x, 'e': msg.y, 'd': msg.z,
-                'vn': msg.vx, 've': msg.vy, 'vd': msg.vz, 'valid': True,
-            })
-            speed = math.hypot(msg.vx, msg.vy)
-            if speed > 0.5:
-                new_chi = math.atan2(msg.vy, msg.vx)
-                # Low-pass filter heading rate
-                raw_dot = (new_chi - self._prev_chi_L) / max(self.dt, 0.001)
-                # Wrap to [-pi, pi]
-                raw_dot = (raw_dot + math.pi) % (2 * math.pi) - math.pi
-                self._chi_dot_L = ((1 - self._CHI_DOT_ALPHA) * self._chi_dot_L
-                                   + self._CHI_DOT_ALPHA * raw_dot)
-                self._prev_chi_L = new_chi
-                self.chi_L = new_chi
-        elif t == 'ATTITUDE':
+        if msg.get_type() == 'LOCAL_POSITION_NED':
+            self.leader_ned['n'], self.leader_ned['e'], self.leader_ned['d'] = msg.x, msg.y, msg.z
+            self.leader_ned['vn'], self.leader_ned['ve'], self.leader_ned['vd'] = msg.vx, msg.vy, msg.vz
+            self.leader_ned['valid'] = True
+        elif msg.get_type() == 'ATTITUDE':
             self.leader_roll = msg.roll
-            self.chi_L       = msg.yaw
-            # Derive heading rate from physics when roll is available
-            l_speed = math.hypot(self.leader_ned['vn'], self.leader_ned['ve'])
-            if l_speed > 1.0:
-                omega_physics = (self.GRAVITY / l_speed) * math.tan(self.leader_roll)
-                self._chi_dot_L = ((1 - self._CHI_DOT_ALPHA) * self._chi_dot_L
-                                   + self._CHI_DOT_ALPHA * omega_physics)
+            self.chi_L = msg.yaw  
 
     def _handle_follower_msg(self, msg):
         if msg.get_type() == 'LOCAL_POSITION_NED':
-            self.follower_ned.update({
-                'n': msg.x, 'e': msg.y, 'd': msg.z,
-                'vn': msg.vx, 've': msg.vy, 'vd': msg.vz, 'valid': True,
-            })
-            speed = math.hypot(msg.vx, msg.vy)
-            if speed > 0.5:
-                self.chi_F = math.atan2(msg.vy, msg.vx)
+            self.follower_ned['n'], self.follower_ned['e'], self.follower_ned['d'] = msg.x, msg.y, msg.z
+            self.follower_ned['vn'], self.follower_ned['ve'], self.follower_ned['vd'] = msg.vx, msg.vy, msg.vz
+            self.follower_ned['valid'] = True
+        elif msg.get_type() == 'ATTITUDE':
+            self.follower_roll = msg.roll
+            self.chi_F = msg.yaw  
 
     def _sync_offset(self):
-        self.offset  = {'n': 0.0, 'e': 0.0, 'd': 0.0}
+        self.offset = {'n': 0.0, 'e': 0.0, 'd': 0.0} 
         self.has_offset = True
 
     def send_attitude_target(self, roll, pitch, yaw, thrust):
         q = self.euler_to_quaternion(roll, pitch, yaw)
         self.follower.mav.set_attitude_target_send(
             0, self.follower.target_system, self.follower.target_component,
-            _ATTITUDE_ONLY_TYPE_MASK, q, 0, 0, 0, thrust,
+            _ATTITUDE_ONLY_TYPE_MASK, q, 0, 0, 0, thrust
         )
 
-    # ------------------------------------------------------------------
-    # MPC leader velocity prediction
-    # ------------------------------------------------------------------
+    # ==========================================
+    # MPC OPTIMIZATION CORE
+    # ==========================================
+    @staticmethod
+    def _wrap_angle(angle):
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
-    def _predict_leader_body_velocities(self, l_speed, chi_L_now):
+    def _roll_from_yaw_rate(self, speed, yaw_rate):
+        roll = math.atan2(speed * yaw_rate, self.GRAVITY)
+        return max(-self.MAX_ROLL_MPC, min(self.MAX_ROLL_MPC, roll))
+
+    def build_reference_horizon(self, leader_speed, leader_turn_rate):
+        """Predict the desired virtual formation point over the MPC horizon."""
+        ref_traj = []
+        pred_ln = self.leader_ned['n']
+        pred_le = self.leader_ned['e']
+        pred_chi = self.chi_L
+
+        for _ in range(self.N_horizon):
+            pred_ln += leader_speed * math.cos(pred_chi) * self.dt_mpc
+            pred_le += leader_speed * math.sin(pred_chi) * self.dt_mpc
+            pred_chi = self._wrap_angle(pred_chi + leader_turn_rate * self.dt_mpc)
+
+            cos_c, sin_c = math.cos(pred_chi), math.sin(pred_chi)
+            slot_n = pred_ln - (self.f_c * cos_c + self.l_c * sin_c)
+            slot_e = pred_le - (self.f_c * sin_c - self.l_c * cos_c)
+
+            slot_vn = (
+                leader_speed * cos_c
+                + leader_turn_rate * (self.f_c * sin_c - self.l_c * cos_c)
+            )
+            slot_ve = (
+                leader_speed * sin_c
+                + leader_turn_rate * (-self.f_c * cos_c - self.l_c * sin_c)
+            )
+            slot_speed = max(self.MIN_SPEED, min(self.MAX_SPEED, math.hypot(slot_vn, slot_ve)))
+            slot_heading = math.atan2(slot_ve, slot_vn)
+            ref_roll = self._roll_from_yaw_rate(slot_speed, leader_turn_rate)
+
+            ref_traj.append({
+                'n': slot_n,
+                'e': slot_e,
+                'speed': slot_speed,
+                'heading': slot_heading,
+                'roll': ref_roll,
+            })
+
+        return ref_traj
+
+    def _shift_warm_start(self, control_sequence):
+        shifted = np.empty_like(control_sequence)
+        shifted[:-2] = control_sequence[2:]
+        shifted[-2:] = control_sequence[-2:]
+        return shifted
+
+    def mpc_cost_function(self, U, x0, reference_traj):
         """
-        Build N predicted leader velocity vectors in the *current* formation
-        body frame.  We propagate chi_L forward using the estimated heading
-        rate and compute the speed-direction decomposition at each step.
-
-        The lateral slot offset (l_c) modifies the effective along-track speed
-        via the coordinated-turn radius relationship, exactly as in the original
-        wingman compensation block.
+        Evaluates the cost of a control sequence U = [v_c_0, gamma_c_0, v_c_1, gamma_c_1, ...]
+        x0 = [n, e, psi, v, gamma]
         """
-        preds = []
-        chi = chi_L_now
-        chi_dot = self._chi_dot_L
-        dt = self.dt
+        cost = 0.0
+        n, e, psi, v, gamma = x0
+        
+        for k in range(self.N_horizon):
+            v_c = U[2*k]
+            gamma_c = U[2*k + 1]
+            
+            # 1. Forward Kinematic Model (from paper equations)
+            # n = x (North), e = y (East) in standard MAVLink
+            dn = v * math.cos(psi)
+            de = v * math.sin(psi)
+            dpsi = (self.GRAVITY * math.tan(gamma)) / max(v, 1.0)
+            dv = (1.0 / self.a_v) * (v_c - v)
+            dgamma = (1.0 / self.a_gamma) * (gamma_c - gamma)
+            
+            # Euler integration
+            n += dn * self.dt_mpc
+            e += de * self.dt_mpc
+            psi = self._wrap_angle(psi + dpsi * self.dt_mpc)
+            v += dv * self.dt_mpc
+            gamma += dgamma * self.dt_mpc
 
-        for k in range(self.mpc.N):
-            # Predicted heading k steps ahead
-            chi_k = chi + chi_dot * k * dt
+            ref = reference_traj[k]
+            pos_error_sq = (n - ref['n'])**2 + (e - ref['e'])**2
+            speed_error_sq = (v - ref['speed'])**2
+            heading_error_sq = self._wrap_angle(psi - ref['heading'])**2
+            control_speed_error_sq = (v_c - ref['speed'])**2
+            control_roll_error_sq = (gamma_c - ref['roll'])**2
 
-            # In formation body frame (aligned with chi_L_now at step 0),
-            # leader's along/cross velocities:
-            delta_chi = chi_k - chi_L_now
-            vl_along =  l_speed * math.cos(delta_chi)
-            vl_cross =  l_speed * math.sin(delta_chi)
+            cost += self.Q_pos * pos_error_sq
+            cost += self.Q_speed * speed_error_sq
+            cost += self.Q_heading * heading_error_sq
+            cost += self.RHO_SPEED * control_speed_error_sq
+            cost += self.RHO_ROLL * control_roll_error_sq
 
-            # Radius compensation: inner/outer wingman speed correction
-            # omega * l_c gives the lateral speed penalty/bonus
-            omega = chi_dot
-            vl_along_adj = vl_along - omega * self.l_c
-
-            preds.append(np.array([vl_along_adj, vl_cross, self.leader_ned['vd']]))
-
-        return preds
-
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
+        return cost
 
     def run(self):
-        print("Syncing frames...")
-        while not (self.has_offset
-                   and self.leader_ned['valid']
-                   and self.follower_ned['valid']):
-            self._drain_messages(self.leader,   self._handle_leader_msg)
-            self._drain_messages(self.follower, self._handle_follower_msg)
-            if (not self.has_offset
-                    and self.leader_ned['valid']
-                    and self.follower_ned['valid']):
-                self._sync_offset()
-            time.sleep(0.05)
-
-        self.set_follower_mode('GUIDED')
-        print("Running MPC Outer Loop + NLDI Inner Loop\n")
-
-        last_time = time.monotonic()
-
-        try:
-            while True:
-                now      = time.monotonic()
-                self.dt  = max(0.001, now - last_time)
-                last_time = now
-                self.mpc.update_dt(self.dt)
-
-                self._drain_messages(self.leader,   self._handle_leader_msg)
+            print("Syncing frames...")
+            while not (self.has_offset and self.leader_ned['valid'] and self.follower_ned['valid']):
+                self._drain_messages(self.leader, self._handle_leader_msg)
                 self._drain_messages(self.follower, self._handle_follower_msg)
-
-                if not self.has_offset:
-                    time.sleep(0.05)
-                    continue
-
-                # ---- Current states ----
-                l_n, l_e, l_d = (self.leader_ned['n'],
-                                  self.leader_ned['e'],
-                                  self.leader_ned['d'])
-                l_speed = math.hypot(self.leader_ned['vn'],
-                                     self.leader_ned['ve'])
-                f_speed = math.hypot(self.follower_ned['vn'],
-                                     self.follower_ned['ve'])
-
-                f_n = self.follower_ned['n'] + self.offset['n']
-                f_e = self.follower_ned['e'] + self.offset['e']
-                f_d = self.follower_ned['d'] + self.offset['d']
-
-                # =====================================================
-                # 1.  OUTER LOOP — MPC (replaces P-control)
-                # =====================================================
-
-                cos_c = math.cos(self.chi_L)
-                sin_c = math.sin(self.chi_L)
-
-                # Desired slot position (NED)
-                slot_n = l_n - (self.f_c * cos_c + self.l_c * sin_c)
-                slot_e = l_e - (self.f_c * sin_c - self.l_c * cos_c)
-                slot_d = l_d + self.v_c
-
-                # Position errors in NED → formation body frame
-                err_n = slot_n - f_n
-                err_e = slot_e - f_e
-                err_d = slot_d - f_d
-
-                along_err = err_n * cos_c + err_e * sin_c
-                cross_err = -err_n * sin_c + err_e * cos_c
-                vert_err  = err_d
-
-                x0 = np.array([along_err, cross_err, vert_err])
-
-                # Predict leader's body-frame velocities over the horizon
-                leader_body_vels = self._predict_leader_body_velocities(
-                    l_speed, self.chi_L)
-
-                # Solve MPC — returns optimal velocity command for this step
-                u_opt, pred_errors = self.mpc.compute(x0, leader_body_vels)
-
-                # u_opt = [v_along_cmd, v_cross_cmd, v_vert_cmd] in body frame
-                target_along_vel = u_opt[0]
-                target_cross_vel = u_opt[1]
-                target_vert_vel  = u_opt[2]
-
-                # Hard speed clamp relative to leader (safety envelope)
-                target_along_vel = max(l_speed - self.MAX_SPEED_DELTA,
-                                       min(l_speed + self.MAX_SPEED_DELTA,
-                                           target_along_vel))
-
-                # Velocity errors → accelerations (inner-loop input)
-                accel_along = (target_along_vel - f_speed) * self.K_P_VEL
-
-                # Cross: MPC already handles turn feedforward via prediction,
-                # but we keep the roll-angle feedforward for large bank angles
-                # (MPC horizon is finite; sharp inputs need direct feedthrough).
-                current_cross_vel = (-self.follower_ned['vn'] * sin_c
-                                     + self.follower_ned['ve'] * cos_c)
-                accel_cross_feedback = ((target_cross_vel - current_cross_vel)
-                                        * self.K_P_VEL)
-
-                if abs(self.leader_roll) > math.radians(5):
-                    accel_cross_feedback = 0.0
-
-                feedforward_lat    = self.chi_L * l_speed
-                accel_cross        = (accel_cross_feedback
-                                      + self.K_TURN_FEEDFORWARD * feedforward_lat)
-
-                current_vert_vel   = self.follower_ned['vd']
-                accel_vert         = ((target_vert_vel - current_vert_vel)
-                                      * self.K_P_VEL)
-
-                # =====================================================
-                # 2.  INNER LOOP — NLDI (unchanged)
-                # =====================================================
-
-                q_bar = 0.5 * self.AIR_DENSITY * (f_speed ** 2)
-                estimated_drag = q_bar * self.WING_AREA * self.CD_0
-
-                req_thrust = (self.AIRCRAFT_MASS * accel_along) + estimated_drag
-                throttle_cmd = max(0.0, min(1.0,
-                                            req_thrust / self.MAX_THRUST_NEWTONS))
-
-                roll_cmd = math.atan(accel_cross / self.GRAVITY)
-                roll_cmd = max(-self.MAX_ROLL, min(self.MAX_ROLL, roll_cmd))
-
-                lift_accel_req = self.GRAVITY - accel_vert
-                cos_roll       = max(math.cos(roll_cmd), 0.5)
-                pitch_cmd      = math.atan(
-                    (lift_accel_req / cos_roll - self.GRAVITY)
-                    / max(f_speed, 1.0))
-                pitch_cmd = max(-self.MAX_PITCH, min(self.MAX_PITCH, pitch_cmd))
-
-                self.send_attitude_target(roll_cmd, pitch_cmd, 0, throttle_cmd)
-
-                # ---- Diagnostics ----
-                if now - self._last_log_time >= self.log_interval_s:
-                    self._last_log_time = now
-                    # Show predicted error at horizon end for MPC health check
-                    pred_along = pred_errors[-1][0] if pred_errors else 0.0
-                    pred_cross = pred_errors[-1][1] if pred_errors else 0.0
-                    print(f"[MPC] Cross Err: {cross_err:+5.1f}m  "
-                          f"Along Err: {along_err:+5.1f}m  "
-                          f"Alt Err: {vert_err:+5.1f}m")
-                    print(f"      Pred@N:   cross={pred_cross:+5.2f}m  "
-                          f"along={pred_along:+5.2f}m  "
-                          f"chi_dot={math.degrees(self._chi_dot_L):+5.2f}°/s\n")
-
+                if not self.has_offset and self.leader_ned['valid'] and self.follower_ned['valid']:
+                    self._sync_offset()
                 time.sleep(0.05)
+                
+            self.set_follower_mode('GUIDED')
+            print("Running Cascaded Controller: MPC Outer Loop + NLDI Inner Loop\n")
 
-        except KeyboardInterrupt:
-            print("\nShutting down controller.")
+            last_time = time.monotonic()
 
+            try:
+                while True:
+                    now = time.monotonic()
+                    self.dt = max(0.001, now - last_time)
+                    last_time = now
+
+                    self._drain_messages(self.leader, self._handle_leader_msg)
+                    self._drain_messages(self.follower, self._handle_follower_msg)
+
+                    if self.has_offset:
+                        # ------------------------------------------
+                        # 1. GENERATE PAPER-STYLE REFERENCE HORIZON
+                        # ------------------------------------------
+                        l_speed = math.hypot(self.leader_ned['vn'], self.leader_ned['ve'])
+                        turn_rate_leader = (self.GRAVITY / max(l_speed, 1.0)) * math.tan(self.leader_roll)
+                        reference_traj = self.build_reference_horizon(l_speed, turn_rate_leader)
+
+                        # ------------------------------------------
+                        # 2. RUN PAPER-ALIGNED KINEMATIC MPC
+                        # ------------------------------------------
+                        f_speed = math.hypot(self.follower_ned['vn'], self.follower_ned['ve'])
+                        x0 = [
+                            self.follower_ned['n'] + self.offset['n'], 
+                            self.follower_ned['e'] + self.offset['e'], 
+                            self.chi_F, 
+                            f_speed, 
+                            self.follower_roll
+                        ]
+                        
+                        # Bounds for the optimizer: [Speed, Roll] for each step.
+                        # The paper constrains speed rate; this first-step bound
+                        # prevents the applied command from jumping rail-to-rail.
+                        max_speed_step = self.MAX_SPEED_RATE * self.dt_mpc
+                        first_min_speed = max(self.MIN_SPEED, self.last_commanded_speed - max_speed_step)
+                        first_max_speed = min(self.MAX_SPEED, self.last_commanded_speed + max_speed_step)
+                        bnds = []
+                        for k in range(self.N_horizon):
+                            if k == 0:
+                                bnds.append((first_min_speed, first_max_speed))
+                            else:
+                                bnds.append((self.MIN_SPEED, self.MAX_SPEED))
+                            bnds.append((-self.MAX_ROLL_MPC, self.MAX_ROLL_MPC))
+
+                        initial_guess = self._shift_warm_start(self.last_optimal_u)
+                        initial_guess[0] = max(first_min_speed, min(first_max_speed, initial_guess[0]))
+
+                        # Optimize over commanded speed and commanded roll.
+                        res = minimize(
+                            self.mpc_cost_function, 
+                            initial_guess, 
+                            args=(x0, reference_traj), 
+                            bounds=bnds,
+                            method='SLSQP',
+                            options={'maxiter': 100, 'ftol': 1e-3}
+                        )
+
+                        if res.success:
+                            self.last_optimal_u = res.x
+                        else:
+                            self.last_optimal_u = initial_guess
+                        
+                        # Extract the first optimal command
+                        target_speed = self.last_optimal_u[0]
+                        target_roll = self.last_optimal_u[1]
+                        self.last_commanded_speed = target_speed
+
+                        # ------------------------------------------
+                        # 3. VERTICAL DECOUPLED LOOP
+                        # ------------------------------------------
+                        target_slot_d = self.leader_ned['d'] + self.v_c
+                        err_d = target_slot_d - (self.follower_ned['d'] + self.offset['d'])
+                        target_vert_vel = self.leader_ned['vd'] + (err_d * self.K_P_POS_VERT)
+
+                        # ------------------------------------------
+                        # 4. NLDI INNER LOOP (Convert targets to forces)
+                        # ------------------------------------------
+                        # Along-track acceleration required to hit target speed
+                        accel_along = (target_speed - f_speed) * self.K_P_VEL
+                        
+                        q_bar = 0.5 * self.AIR_DENSITY * (max(f_speed, 1.0) ** 2)
+                        estimated_drag = q_bar * self.WING_AREA * self.CD_0 
+                        
+                        req_thrust_newtons = (self.AIRCRAFT_MASS * accel_along) + estimated_drag
+                        throttle_cmd = max(0.0, min(1.0, req_thrust_newtons / self.MAX_THRUST_NEWTONS))
+                        
+                        # Vertical acceleration required
+                        accel_vert = (target_vert_vel - self.follower_ned['vd']) * self.K_P_VEL
+                        lift_accel_req = self.GRAVITY - accel_vert 
+                        
+                        cos_roll = max(math.cos(target_roll), 0.5)
+                        pitch_cmd = math.atan((lift_accel_req / cos_roll - self.GRAVITY) / max(f_speed, 1.0))
+                        pitch_cmd = max(-self.MAX_PITCH, min(self.MAX_PITCH, pitch_cmd))
+                        
+                        # Send MPC-derived roll and NLDI-derived pitch/throttle
+                        self.send_attitude_target(target_roll, pitch_cmd, 0, throttle_cmd)
+
+                        if self.vis_queue is not None:
+                            payload = {
+                                'target_speed': target_speed,
+                                'actual_speed': f_speed,
+                                'target_roll': target_roll,
+                                'actual_roll': self.follower_roll,
+                                'target_vert_vel': target_vert_vel,
+                                'actual_vert_vel': self.follower_ned['vd']
+                            }
+                            try:
+                                self.vis_queue.put_nowait(payload)
+                            except multiprocessing.queues.Full:
+                                pass
+
+                    time.sleep(0.05)
+
+            except KeyboardInterrupt:
+                print("\nShutting down controller.")
 
 if __name__ == "__main__":
     clearances = {'f_c': 5.0, 'l_c': 5.0, 'v_c': 0}
-    controller = CascadedFormationController(
-        "udp:127.0.0.1:14552", "udp:127.0.0.1:14562", clearances)
+
+    shared_queue = multiprocessing.Queue(maxsize=10)
+    
+    plot_process = multiprocessing.Process(target=run_visualizer, args=(shared_queue,))
+    plot_process.daemon = True
+    plot_process.start()
+
+    controller = CascadedFormationController("udp:127.0.0.1:14552", "udp:127.0.0.1:14562", clearances, visualizer_queue=shared_queue)
     controller.run()
