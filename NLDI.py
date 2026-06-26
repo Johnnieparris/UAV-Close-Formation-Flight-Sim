@@ -2,11 +2,92 @@ import time
 import math
 from pymavlink import mavutil
 
+import multiprocessing
+import matplotlib.pyplot as plt
+from collections import deque
+
+def run_visualizer(data_queue):
+    """Runs in a separate process to handle real-time plotting."""
+    plt.style.use('dark_background')
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    ax_along, ax_cross, ax_vert = axes
+    fig.suptitle("Outer Loop Velocity Commands vs Follower Response", fontsize=14, color='white')
+
+    # History buffers for trailing traces
+    max_history = 100
+    time_hist = deque(maxlen=max_history)
+    target_along_vel_hist = deque(maxlen=max_history)
+    actual_along_vel_hist = deque(maxlen=max_history)
+    target_cross_vel_hist = deque(maxlen=max_history)
+    actual_cross_vel_hist = deque(maxlen=max_history)
+    target_vert_vel_hist = deque(maxlen=max_history)
+    actual_vert_vel_hist = deque(maxlen=max_history)
+
+    t_start = time.time()
+
+    while plt.fignum_exists(fig.number):
+        # Consume all available data points in the queue to get the latest state
+        data = None
+        while not data_queue.empty():
+            try:
+                data = data_queue.get_nowait()
+            except Exception:
+                break
+
+        if data is not None:
+            # Unpack payload
+            target_along_vel = data['target_along_vel']
+            actual_along_vel = data['actual_along_vel']
+            target_cross_vel = data['target_cross_vel']
+            actual_cross_vel = data['actual_cross_vel']
+            target_vert_vel = data['target_vert_vel']
+            actual_vert_vel = data['actual_vert_vel']
+            roll_cmd, throttle_cmd = data['roll_cmd'], data['throttle_cmd']
+
+            # Append command/response histories
+            time_hist.append(time.time() - t_start)
+            target_along_vel_hist.append(target_along_vel)
+            actual_along_vel_hist.append(actual_along_vel)
+            target_cross_vel_hist.append(target_cross_vel)
+            actual_cross_vel_hist.append(actual_cross_vel)
+            target_vert_vel_hist.append(target_vert_vel)
+            actual_vert_vel_hist.append(actual_vert_vel)
+
+            time_values = list(time_hist)
+
+            for ax in axes:
+                ax.clear()
+                ax.grid(True, color='gray', alpha=0.3)
+
+            ax_along.plot(time_values, list(target_along_vel_hist), 'y-', label='Outer Loop Cmd')
+            ax_along.plot(time_values, list(actual_along_vel_hist), 'c--', label='Follower Actual')
+            ax_along.set_title(f"Along-Track Velocity | Thr Cmd: {throttle_cmd*100:.1f}%")
+            ax_along.set_ylabel("Velocity (m/s)")
+            ax_along.legend(loc='upper left')
+
+            ax_cross.plot(time_values, list(target_cross_vel_hist), 'y-', label='Outer Loop Cmd')
+            ax_cross.plot(time_values, list(actual_cross_vel_hist), 'c--', label='Follower Actual')
+            ax_cross.set_title(f"Cross-Track Velocity | Roll Cmd: {math.degrees(roll_cmd):.1f}°")
+            ax_cross.set_ylabel("Velocity (m/s)")
+            ax_cross.legend(loc='upper left')
+
+            ax_vert.plot(time_values, list(target_vert_vel_hist), 'y-', label='Outer Loop Cmd')
+            ax_vert.plot(time_values, list(actual_vert_vel_hist), 'c--', label='Follower Actual')
+            ax_vert.set_title("Vertical Velocity (NED Down Positive)")
+            ax_vert.set_xlabel("Time (s)")
+            ax_vert.set_ylabel("Velocity (m/s)")
+            ax_vert.legend(loc='upper left')
+
+            plt.pause(0.01) # Yield to UI thread execution loop
+
+        time.sleep(0.02) # Cap graph redraw attempts near ~50Hz
+
 # Ignore roll/pitch/yaw body rates; target attitude quaternion & thrust only.
 _ATTITUDE_ONLY_TYPE_MASK = 0b00000111
 
 class CascadedFormationController:
-    def __init__(self, leader_port, follower_port, offsets):
+    def __init__(self, leader_port, follower_port, offsets, visualizer_queue=None):
+        self.vis_queue = visualizer_queue
         print(f"Connecting to Leader on {leader_port}...")
         self.leader = mavutil.mavlink_connection(leader_port)
 
@@ -32,11 +113,16 @@ class CascadedFormationController:
         
         # --- OUTER LOOP: KINEMATIC GAINS ---
         # How aggressively to close the distance gaps (Position Error -> Target Velocity)
-        self.K_P_POS_ALONG = 0.4
+        self.K_P_POS_ALONG = 0.1
+        self.K_D_POS_ALONG = 0.0  # <-- NEW: Along-track damping gain
+
         self.K_P_POS_CROSS = 0.15
         self.K_P_POS_VERT  = 0.9
 
-        self.K_TURN_FEEDFORWARD = 0.85
+        self.last_along_err = 0.0
+        self.is_first_loop = True   # Prevents a massive derivative spike on startup
+
+        self.K_TURN_FEEDFORWARD = 0.9
         
         # How aggressively to achieve target velocities (Velocity Error -> Target Acceleration)
         self.K_P_VEL = 0.6
@@ -55,6 +141,7 @@ class CascadedFormationController:
         self.chi_L = 0.0  
         self.chi_F = 0.0  
         self.dt = 0.05
+        
 
         self._last_log_time = 0.0
         self.log_interval_s = 0.5 
@@ -113,21 +200,21 @@ class CascadedFormationController:
             self.leader_ned['n'], self.leader_ned['e'], self.leader_ned['d'] = msg.x, msg.y, msg.z
             self.leader_ned['vn'], self.leader_ned['ve'], self.leader_ned['vd'] = msg.vx, msg.vy, msg.vz
             self.leader_ned['valid'] = True
-            speed = math.hypot(msg.vx, msg.vy)
-            if speed > 0.5:
-                self.chi_L = math.atan2(msg.vy, msg.vx)
+            # REMOVE the chi_L calculation from here entirely
+
         elif msg.get_type() == 'ATTITUDE':
             self.leader_roll = msg.roll
-            self.chi_L = msg.yaw  
+            self.chi_L = msg.yaw  # Keep this as your single source of truth for orientation
 
     def _handle_follower_msg(self, msg):
         if msg.get_type() == 'LOCAL_POSITION_NED':
             self.follower_ned['n'], self.follower_ned['e'], self.follower_ned['d'] = msg.x, msg.y, msg.z
             self.follower_ned['vn'], self.follower_ned['ve'], self.follower_ned['vd'] = msg.vx, msg.vy, msg.vz
             self.follower_ned['valid'] = True
-            speed = math.hypot(msg.vx, msg.vy)
-            if speed > 0.5:
-                self.chi_F = math.atan2(msg.vy, msg.vx)
+        
+        elif msg.get_type() == 'ATTITUDE':
+            self.follower_roll = msg.roll
+            self.chi_F = msg.yaw  # Keep this as your single source of truth for orientation
 
     def _sync_offset(self):
         self.offset = {'n': 0.0, 'e': 0.0, 'd': 0.0} 
@@ -190,13 +277,32 @@ class CascadedFormationController:
                         along_err = err_n * cos_c + err_e * sin_c
                         cross_err = -err_n * sin_c + err_e * cos_c
 
+                        if self.is_first_loop:
+                            along_err_dot = 0
+                            self.is_first_loop = False
+                        else:
+                            along_err_dot = (along_err - self.last_along_err) / self.dt
+                            self.last_along_err = along_err
+
                         # Desired Velocities
                         l_speed = math.hypot(self.leader_ned['vn'], self.leader_ned['ve'])
                         f_speed = math.hypot(self.follower_ned['vn'], self.follower_ned['ve'])
-                        
-                        target_along_vel = l_speed + (along_err * self.K_P_POS_ALONG)
+
+                        # --- NEW: KINEMATIC WINGMAN COMPENSATION ---
+                        # Calculate leader's turn rate (rad/s) using coordinated turn physics: omega = g * tan(roll) / V
+                        turn_rate_leader = (self.GRAVITY / max(l_speed, 1.0)) * math.tan(self.leader_roll)
+
+                        # Dynamic feedforward base speed: V_slot = V_leader - (omega * lateral_offset)
+                        # (Subtracted because a positive roll/turn_rate means a right turn, making a right-wingman fly the inner radius)
+                        wingman_base_speed = l_speed - (turn_rate_leader * self.l_c)
+                        # --------------------------------------------
+
+                        # Apply proportional position feedback to the adjusted kinematic base speed
+                        target_along_vel = wingman_base_speed + (along_err * self.K_P_POS_ALONG) + (along_err_dot * self.K_D_POS_ALONG)
+
+                        # Constrain the target speed relative to the leader's actual speed
                         target_along_vel = max(l_speed - self.MAX_SPEED_DELTA, min(l_speed + self.MAX_SPEED_DELTA, target_along_vel))
-                        
+
                         target_cross_vel = cross_err * self.K_P_POS_CROSS
                         target_vert_vel  = self.leader_ned['vd'] + (err_d * self.K_P_POS_VERT)
 
@@ -204,14 +310,14 @@ class CascadedFormationController:
                         accel_along = (target_along_vel - f_speed) * self.K_P_VEL
                         
                         # --- CROSS-TRACK ACCELERATION BREAKDOWN FOR DIAGNOSTICS ---
+                        current_along_vel = self.follower_ned['vn'] * cos_c + self.follower_ned['ve'] * sin_c
                         current_cross_vel = -self.follower_ned['vn'] * sin_c + self.follower_ned['ve'] * cos_c
                         
                         # 1. Proportional feedback component (based on position and velocity tracking errors)
                         accel_cross_feedback = (target_cross_vel - current_cross_vel) * self.K_P_VEL
                         
-                        # Disable cross track feedback input if the leader's absolute roll angle is over 5 degrees
-                        if abs(self.leader_roll) > math.radians(5):
-                            accel_cross_feedback = 0.0
+                        roll_blend = max(0, 1.0 - abs(self.leader_roll) / math.radians(45))
+                        accel_cross_feedback *= roll_blend
                         
                         # 2. Feedforward component (based on leader's bank angle)
                         turn_rate_leader = (self.GRAVITY / max(l_speed, 1.0)) * math.tan(self.leader_roll)
@@ -232,6 +338,8 @@ class CascadedFormationController:
                         
                         req_thrust_newtons = (self.AIRCRAFT_MASS * accel_along) + estimated_drag
                         throttle_cmd = max(0.0, min(1.0, req_thrust_newtons / self.MAX_THRUST_NEWTONS))
+                        # Inside the run loop, smooth out the throttle command
+    
                         
                         # Calculate final roll command
                         roll_cmd = math.atan(accel_cross / self.GRAVITY)
@@ -246,6 +354,22 @@ class CascadedFormationController:
                         
                         self.send_attitude_target(roll_cmd, pitch_cmd, 0, throttle_cmd)
 
+                        if self.vis_queue is not None:
+                            payload = {
+                                'target_along_vel': target_along_vel,
+                                'actual_along_vel': current_along_vel,
+                                'target_cross_vel': target_cross_vel,
+                                'actual_cross_vel': current_cross_vel,
+                                'target_vert_vel': target_vert_vel,
+                                'actual_vert_vel': self.follower_ned['vd'],
+                                'roll_cmd': roll_cmd, 'throttle_cmd': throttle_cmd
+                            }
+                            # Non-blocking put: if visualizer slows down, ignore frame to avoid locking controller
+                            try:
+                                self.vis_queue.put_nowait(payload)
+                            except multiprocessing.queues.Full:
+                                pass
+
                         # --- ENHANCED DIAGNOSTIC TELEMETRY ---
                         if now - self._last_log_time >= self.log_interval_s:
                             self._last_log_time = now
@@ -259,6 +383,15 @@ class CascadedFormationController:
                 print("\nShutting down controller.")
 
 if __name__ == "__main__":
-    clearances = {'f_c': 10.0, 'l_c': 0.0, 'v_c': 0}
-    controller = CascadedFormationController("udp:127.0.0.1:14552", "udp:127.0.0.1:14562", clearances)
+    clearances = {'f_c': 5.0, 'l_c': 5.0, 'v_c': 0}
+
+    shared_queue = multiprocessing.Queue(maxsize=10)
+    
+    # Spawn the independent visualizer process first
+    plot_process = multiprocessing.Process(target=run_visualizer, args=(shared_queue,))
+    plot_process.daemon = True
+    plot_process.start()
+
+
+    controller = CascadedFormationController("udp:127.0.0.1:14552", "udp:127.0.0.1:14562", clearances, visualizer_queue=shared_queue)
     controller.run()
