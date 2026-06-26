@@ -107,20 +107,20 @@ class CascadedFormationController:
         self.MAX_PITCH = math.radians(20)
 
         # --- MPC PARAMETERS (paper-aligned outer loop) ---
-        self.N_horizon = 8
-        self.dt_mpc = 0.5
-        self.a_v = 3.2
-        self.a_gamma = 0.6
+        self.N_horizon = 20
+        self.dt_mpc = 0.2
+        self.a_v = 6
+        self.a_gamma = 8
 
         self.Q_pos = 1.0
-        self.Q_speed = 0.05
-        self.Q_heading = 0.5
+        self.Q_speed = 1
+        self.Q_heading = 20
         self.RHO_SPEED = 5
         self.RHO_ROLL = 500
 
         self.MAX_SPEED = 30.0
         self.MIN_SPEED = 10.0
-        self.MAX_SPEED_RATE = 5.0
+        self.MAX_SPEED_RATE = 10.0
         self.MAX_ROLL_MPC = math.radians(30)
 
         # Optimizer state (warm start)
@@ -450,7 +450,7 @@ if __name__ == "__main__":
     
     plot_process = multiprocessing.Process(target=run_visualizer, args=(shared_queue,))
     plot_process.daemon = True
-    plot_process.start()
+    #plot_process.start()
 
     controller = CascadedFormationController("udp:127.0.0.1:14552", "udp:127.0.0.1:14562", clearances, visualizer_queue=shared_queue)
     controller.run()
