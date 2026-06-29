@@ -1,4 +1,6 @@
-# UAV-Close-Formation-Flight-Sim
+<img width="720" height="406" alt="Autonomous Close formation flight simulation Demo - Johnnie Parris (1080p)" src="https://github.com/user-attachments/assets/b61b587a-b7db-4093-af2a-f399f3f72681" /># UAV-Close-Formation-Flight-Sim
+
+<img width="720" height="406" alt="Autonomous Close formation flight simulation Demo - Johnnie Parris (1080p)" src="https://github.com/user-attachments/assets/9b93148c-f830-4cf4-966a-47a4f778adb3" />
 
 [v2 Demo Video](https://youtu.be/0t0efAYN2Lk)
 [v1 Demo Video](https://youtu.be/4QiX2s9aTNU)
