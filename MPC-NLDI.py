@@ -103,23 +103,23 @@ class CascadedFormationController:
         self.GRAVITY = 9.81            
         
         self.K_P_POS_VERT  = 0.9
-        self.K_P_VEL = 0.6
+        self.K_P_VEL = 0.3
         self.MAX_PITCH = math.radians(20)
 
         # --- MPC PARAMETERS (paper-aligned outer loop) ---
         self.N_horizon = 20
         self.dt_mpc = 0.2
         self.a_v = 6
-        self.a_gamma = 8
+        self.a_gamma = 6
 
         self.Q_pos = 1.0
         self.Q_speed = 1
         self.Q_heading = 20
-        self.RHO_SPEED = 5
+        self.RHO_SPEED = 10
         self.RHO_ROLL = 500
 
         self.MAX_SPEED = 30.0
-        self.MIN_SPEED = 10.0
+        self.MIN_SPEED = 5.0
         self.MAX_SPEED_RATE = 10.0
         self.MAX_ROLL_MPC = math.radians(30)
 
@@ -421,8 +421,10 @@ class CascadedFormationController:
                         pitch_cmd = math.atan((lift_accel_req / cos_roll - self.GRAVITY) / max(f_speed, 1.0))
                         pitch_cmd = max(-self.MAX_PITCH, min(self.MAX_PITCH, pitch_cmd))
                         
-                        # Send MPC-derived roll and NLDI-derived pitch/throttle
-                        self.send_attitude_target(target_roll, pitch_cmd, 0, throttle_cmd)
+                        target_yaw_rate = (self.GRAVITY * math.tan(target_roll)) / max(f_speed, 1.0)
+
+                        # Send MPC-derived roll/yaw and NLDI-derived pitch/throttle
+                        self.send_attitude_target(target_roll, pitch_cmd, target_yaw_rate, throttle_cmd)
 
                         if self.vis_queue is not None:
                             payload = {
@@ -444,7 +446,7 @@ class CascadedFormationController:
                 print("\nShutting down controller.")
 
 if __name__ == "__main__":
-    clearances = {'f_c': 5.0, 'l_c': 5.0, 'v_c': 0}
+    clearances = {'f_c': 10.0, 'l_c': 10.0, 'v_c': 0}
 
     shared_queue = multiprocessing.Queue(maxsize=10)
     

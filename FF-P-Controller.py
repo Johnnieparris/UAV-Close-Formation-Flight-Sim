@@ -35,7 +35,7 @@ class ArduPlaneFeedForwardController:
         
         # Inner Loop: Speed Error to Thrust PI Controller
         self.K_P_VEL = 0.05    
-        self.K_I_VEL = 0.015   
+        self.K_I_VEL = 0.06   
         
         # Integrator state for velocity PI loop
         self.vel_integrator = 0.0
@@ -306,6 +306,6 @@ class ArduPlaneFeedForwardController:
             print("\nShutting down controller.")
 
 if __name__ == "__main__":
-    clearances = {'f_c': 10.0, 'l_c': 0.0, 'v_c': -2.0}
+    clearances = {'f_c': 10.0, 'l_c': 10.0, 'v_c': -2.0}
     controller = ArduPlaneFeedForwardController("udp:127.0.0.1:14552", "udp:127.0.0.1:14562", clearances)
     controller.run()

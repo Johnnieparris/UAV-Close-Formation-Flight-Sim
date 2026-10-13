@@ -122,7 +122,7 @@ class CascadedFormationController:
         self.last_along_err = 0.0
         self.is_first_loop = True   # Prevents a massive derivative spike on startup
 
-        self.K_TURN_FEEDFORWARD = 0.9
+        self.K_TURN_FEEDFORWARD = 0.85
         
         # How aggressively to achieve target velocities (Velocity Error -> Target Acceleration)
         self.K_P_VEL = 0.6
@@ -352,8 +352,7 @@ class CascadedFormationController:
                         cos_roll = max(math.cos(roll_cmd), 0.5)
                         pitch_cmd = math.atan((lift_accel_req / cos_roll - self.GRAVITY) / max(f_speed, 1.0))
                         pitch_cmd = max(-self.MAX_PITCH, min(self.MAX_PITCH, pitch_cmd))
-                        target_yaw = self.chi_L + math.atan2(target_cross_vel, max(f_speed, 1.0))
-                        
+                        target_yaw_rate = (self.GRAVITY * math.tan(roll_cmd)) / max(f_speed, 1.0)                        
                         self.send_attitude_target(roll_cmd, pitch_cmd, 0, throttle_cmd)
 
                         if self.vis_queue is not None:
@@ -385,14 +384,14 @@ class CascadedFormationController:
                 print("\nShutting down controller.")
 
 if __name__ == "__main__":
-    clearances = {'f_c': 5.0, 'l_c': 5.0, 'v_c': 0}
+    clearances = {'f_c': 10.0, 'l_c': 5.0, 'v_c': 0}
 
     shared_queue = multiprocessing.Queue(maxsize=10)
     
     # Spawn the independent visualizer process first
     plot_process = multiprocessing.Process(target=run_visualizer, args=(shared_queue,))
     plot_process.daemon = True
-    plot_process.start()
+    #plot_process.start()
 
 
     controller = CascadedFormationController("udp:127.0.0.1:14552", "udp:127.0.0.1:14562", clearances, visualizer_queue=shared_queue)
